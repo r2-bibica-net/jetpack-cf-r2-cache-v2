@@ -23,7 +23,7 @@ async function serveAsset(request, event, context, env) {
   const hasQueryParams = url.search !== '';
   if (hasQueryParams) {
     const referer = request.headers.get('Referer');
-    const allowedDomains = ['bibica.net', 'static.bibica.net', 'comment.bibica.net'];
+    const allowedDomains = ['bibica.net', 'static.bibica.net', 'comment.bibica.net', 'jetpack-cf-r2-cache-v2.pages.dev'];
     
     if (referer) {
       try {
