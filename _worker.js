@@ -23,7 +23,7 @@ async function serveAsset(request, event, context, env) {
   const hasQueryParams = url.search !== '';
   if (hasQueryParams) {
     const referer = request.headers.get('Referer');
-    const allowedDomains = ['bibica.net', 'static.bibica.net', 'comment.bibica.net', 'jetpack-cf-r2-cache-v2.pages.dev'];
+    const allowedDomains = ['bibica.net', 'static.bibica.net', 'comment.bibica.net'];
     
     if (referer) {
       try {
@@ -54,11 +54,22 @@ async function serveAsset(request, event, context, env) {
     }
   }
   
-  // Kiểm tra Cloudflare Cache
-  const cache = caches.default;
-  let response = await cache.match(request);
-  if (response) {
-    return response;
+  // Tạo key cho R2, dựa trên path gốc
+  const r2Key = url.pathname + (url.search || '');
+  
+  // Kiểm tra xem có force reload từ source không
+  const forceReload = url.searchParams.has('force');
+  
+  // Kiểm tra Cloudflare Cache nếu không force reload
+  if (!forceReload) {
+    const cache = caches.default;
+    let cachedResponse = await cache.match(request);
+    if (cachedResponse) {
+      return new Response(cachedResponse.body, {
+        headers: new Headers(cachedResponse.headers),
+        status: cachedResponse.status
+      });
+    }
   }
   
   const rule = Object.entries(rules).find(([prefix]) => url.pathname.startsWith(prefix));
@@ -68,71 +79,86 @@ async function serveAsset(request, event, context, env) {
   
   const [prefix, config] = rule;
   
-  // Tạo key cho R2, dựa trên path gốc
-  const r2Key = url.pathname + (url.search || '');
-  
-  // Thử lấy ảnh từ R2 trước
-  try {
-    const r2Object = await env.IMAGES_BUCKET.get(r2Key);
-    if (r2Object) {
-      const headers = new Headers();
-      headers.set("content-type", "image/webp"); // Mặc định là webp cho ảnh từ R2
-      headers.set("cache-control", "public, max-age=31536000");
-      headers.set("vary", "Accept");
-      headers.set('X-Served-By', `Cloudflare R2 & ${config.service}`);
+  // Thử lấy ảnh từ R2 trước, trừ khi force reload
+  if (!forceReload) {
+    try {
+      console.log(`Trying to fetch from R2: ${r2Key}`);
+      const r2Object = await env.IMAGES_BUCKET.get(r2Key);
       
-      response = new Response(r2Object.body, { 
-        headers: headers
-      });
-      
-      // Cache response
-      context.waitUntil(cache.put(request, response.clone()));
-      return response;
+      if (r2Object) {
+        console.log(`Successfully fetched from R2: ${r2Key}`);
+        const headers = new Headers();
+        headers.set("content-type", r2Object.httpMetadata.contentType || "image/webp");
+        headers.set("cache-control", "public, max-age=31536000");
+        headers.set("vary", "Accept");
+        headers.set('X-Served-By', `Cloudflare R2 & ${config.service}`);
+        
+        const response = new Response(r2Object.body, { 
+          headers: headers
+        });
+        
+        // Cache response
+        const cache = caches.default;
+        context.waitUntil(cache.put(request, response.clone()));
+        return response;
+      } else {
+        console.log(`Object not found in R2: ${r2Key}`);
+      }
+    } catch (error) {
+      console.error(`R2 error for ${r2Key}:`, error);
+      // Nếu R2 lỗi, tiếp tục lấy từ nguồn gốc
     }
-  } catch (error) {
-    console.error("R2 error:", error);
-    // Nếu R2 lỗi, tiếp tục lấy từ nguồn gốc
   }
   
-  // Nếu không có trong R2, lấy từ nguồn gốc (Jetpack)
+  // Nếu không có trong R2 hoặc force reload, lấy từ nguồn gốc (Jetpack)
+  console.log(`Fetching from origin for: ${r2Key}`);
   const targetUrl = new URL(request.url);
   targetUrl.hostname = config.targetHost;
   targetUrl.pathname = config.pathTransform(url.pathname, prefix);
   targetUrl.search = url.search;
   
-  response = await fetch(targetUrl, {
+  const originResponse = await fetch(targetUrl, {
     headers: { 'Accept': request.headers.get('Accept') || '*/*' }
   });
   
-  if (!response.ok) {
-    return response;
+  if (!originResponse.ok) {
+    return originResponse;
   }
   
   // Clone response để lưu vào R2
-  const responseClone = response.clone();
+  const responseClone = originResponse.clone();
+  const contentType = originResponse.headers.get('content-type') || "image/webp";
   
-  // Lưu vào R2 (giữ nguyên content-type)
+  // Lưu vào R2 (giữ nguyên content-type từ response)
   context.waitUntil(
     responseClone.arrayBuffer().then(buffer => {
+      console.log(`Saving to R2: ${r2Key} as ${contentType}`);
       return env.IMAGES_BUCKET.put(r2Key, buffer, {
         httpMetadata: {
-          contentType: "image/webp" // Mặc định lưu vào R2 dưới dạng webp
+          contentType: contentType
         }
       });
     }).catch(error => {
-      console.error("Error saving to R2:", error);
+      console.error(`Error saving to R2 for ${r2Key}:`, error);
     })
   );
   
-  const headers = new Headers(response.headers);
+  const headers = new Headers(originResponse.headers);
   headers.set("cache-control", "public, max-age=31536000");
   headers.set("vary", "Accept");
   headers.set('X-Served-By', `Cloudflare Pages & ${config.service} (first load)`);
   
-  response = new Response(response.body, { ...response, headers });
-  context.waitUntil(cache.put(request, response.clone()));
+  const finalResponse = new Response(originResponse.body, { 
+    status: originResponse.status,
+    statusText: originResponse.statusText,
+    headers: headers
+  });
   
-  return response;
+  // Cache response
+  const cache = caches.default;
+  context.waitUntil(cache.put(request, finalResponse.clone()));
+  
+  return finalResponse;
 }
 
 export default {
